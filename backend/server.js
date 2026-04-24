@@ -81,6 +81,82 @@ startStatsTicker(io);
 startLogTicker(io);
 startSmsTicker(io);
 
+// ============================================================
+//  DISASTER DETECTION LAYER
+//  Isolated addition — does NOT touch any code above this line.
+//  All existing routes, sockets, tickers, and state are untouched.
+// ============================================================
+
+// ── USGS feed URL ─────────────────────────────────────────────
+const USGS_URL =
+  "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson";
+
+// ── Resolve fetch (Node 18+ has it built-in, older needs node-fetch) ──
+const _fetch = (() => {
+  if (typeof globalThis.fetch === "function") return globalThis.fetch.bind(globalThis);
+  try { return require("node-fetch"); } catch (_) { return null; }
+})();
+
+/**
+ * GET /api/earthquakes
+ * Proxies the USGS hourly GeoJSON feed and returns a clean array:
+ *   [{ id, type, magnitude, place, lat, lng, time }, ...]
+ *
+ * The frontend calls this to avoid CORS issues hitting USGS directly.
+ */
+app.get("/api/earthquakes", async (req, res) => {
+  if (!_fetch) {
+    return res.status(500).json({
+      error: "fetch not available — run Node 18+ or install node-fetch",
+    });
+  }
+
+  try {
+    const upstream = await _fetch(USGS_URL, {
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!upstream.ok) {
+      throw new Error(`USGS responded with HTTP ${upstream.status}`);
+    }
+
+    const geojson = await upstream.json();
+
+    const events = (geojson.features ?? []).map((feature) => {
+      const p   = feature.properties;
+      const [lng, lat] = feature.geometry?.coordinates ?? [0, 0];
+
+      return {
+        id:        feature.id,
+        type:      "earthquake",
+        magnitude: p.mag   ?? 0,
+        place:     p.place ?? "Unknown location",
+        lat:       parseFloat(lat.toFixed(4)),
+        lng:       parseFloat(lng.toFixed(4)),
+        time:      p.time  ?? Date.now(),
+      };
+    });
+
+    // Sort newest-first (USGS already does this, but be explicit)
+    events.sort((a, b) => b.time - a.time);
+
+    // If a meaningful event (M>4.5) exists, broadcast it to all connected sockets
+    // so clients running in AUTO mode get it without needing to poll themselves.
+    const notable = events.find(e => e.magnitude > 4.5);
+    if (notable) {
+      io.emit("live_earthquake", notable);
+      console.log(`[Earthquake] Broadcast live_earthquake: M${notable.magnitude} — ${notable.place}`);
+    }
+
+    console.log(`[Earthquake] Returned ${events.length} events from USGS`);
+    return res.json(events);
+
+  } catch (err) {
+    console.error("[Earthquake] Fetch error:", err.message);
+    return res.status(502).json({ error: err.message });
+  }
+});
+
 // ── Start ──────────────────────────────────────────────────────
 server.listen(PORT, () => {
   console.log(`
@@ -93,6 +169,7 @@ server.listen(PORT, () => {
 ║          POST /chat                          ║
 ║          GET  /state                         ║
 ║          GET  /health                        ║
+║          GET  /api/earthquakes  <- NEW        ║
 ║  Mode  → ${process.env.ANTHROPIC_API_KEY ? "Claude API (LIVE)" : "Mock AI (no API key)       "}       ║
 ╚══════════════════════════════════════════════╝
   `);
